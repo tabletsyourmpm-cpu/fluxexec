@@ -67,7 +67,7 @@ static bool install_hook(uintptr_t target_addr) {
     p[1] = 0xD61F0200; // br x16
     *(uintptr_t*)(p + 2) = (uintptr_t)hook_lua_pushnumber;
     
-    __builtin___clear_cache((void*)target_addr, (void*)(target_addr + 16));
+    __builtin___clear_cache((char*)target_addr, (char*)(target_addr + 16));
     LOGI("Hook installed at %p", (void*)target_addr);
     return true;
 }
