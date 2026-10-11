@@ -120,6 +120,6 @@ Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, js
 }
 
 __attribute__((constructor)) static void init() {
-    LOGI("libfluxexec hook loaded");
-    resolve();
+    LOGI("libfluxexec loaded (hook on-demand only)");
+    // Don't auto-install hook - wait for nativeExecute when libroblox.so is confirmed loaded
 }
