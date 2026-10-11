@@ -44,8 +44,12 @@ void hook_lua_pushnumber(lua_State* L, double n) {
     __builtin___clear_cache((char*)g_target, (char*)(g_target + 16));
     g_hooked = false;
     LOGI("Hook removed, jumping to original");
-    // Jump to original (tail call) - does not return here
-    __asm__ volatile("br %0" :: "r"(g_target));
+    // Pop the prologue (stp x29, x30, [sp, #-16]!) before jumping
+    // to avoid stack misalignment -> BUS_ADRALN
+    __asm__ volatile(
+        "ldp x29, x30, [sp], #16\n"
+        "br %0" :: "r"(g_target)
+    );
     __builtin_unreachable();
 }
 
