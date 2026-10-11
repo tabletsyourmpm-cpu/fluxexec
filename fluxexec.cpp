@@ -100,6 +100,87 @@ static unsigned int ConvertOp(unsigned int inst) {
     return result;
 }
 
+// Varint encoding (from RC7)
+static int encode_varint(unsigned long long value, unsigned char* out) {
+    int len = 0;
+    while (value >= 0x80) {
+        out[len++] = (value & 0x7F) | 0x80;
+        value >>= 7;
+    }
+    out[len++] = value & 0x7F;
+    return len;
+}
+
+// Build a minimal Roblox bytecode chunk for the WalkSpeed script
+// Based on RC7's format: 5 varints header + instructions + constants
+// Returns the size, or 0 on failure
+static int build_walkspeed_chunk(unsigned char* out, int out_size) {
+    // Converted instructions (9 total)
+    unsigned int std_instrs[9] = {
+        0x00000005, 0x0040400b, 0x00008081, 0x0180801c,
+        0x0040c006, 0x00410006, 0x00414006, 0x8341c009, 0x0080001e
+    };
+    
+    // Constants: 7 strings + 1 number (59.0)
+    const char* strings[7] = {"game", "GetService", "Players", "LocalPlayer", "Character", "Humanoid", "WalkSpeed"};
+    
+    int pos = 0;
+    unsigned char varint_buf[10];
+    int len;
+    
+    // Header: 5 varints [numparams, numupvals, num_instructions, num_constants, num_protos]
+    // For main function: params=0, upvals=0, instructions=9, constants=8, protos=0
+    len = encode_varint(0, varint_buf); // numparams
+    if (pos + len > out_size) return 0;
+    memcpy(out + pos, varint_buf, len); pos += len;
+    
+    len = encode_varint(0, varint_buf); // numupvals
+    if (pos + len > out_size) return 0;
+    memcpy(out + pos, varint_buf, len); pos += len;
+    
+    len = encode_varint(9, varint_buf); // num_instructions
+    if (pos + len > out_size) return 0;
+    memcpy(out + pos, varint_buf, len); pos += len;
+    
+    len = encode_varint(8, varint_buf); // num_constants
+    if (pos + len > out_size) return 0;
+    memcpy(out + pos, varint_buf, len); pos += len;
+    
+    len = encode_varint(0, varint_buf); // num_protos
+    if (pos + len > out_size) return 0;
+    memcpy(out + pos, varint_buf, len); pos += len;
+    
+    // Instructions (converted)
+    for (int i = 0; i < 9; i++) {
+        unsigned int converted = ConvertOp(std_instrs[i]);
+        if (pos + 4 > out_size) return 0;
+        // Little-endian
+        out[pos++] = converted & 0xFF;
+        out[pos++] = (converted >> 8) & 0xFF;
+        out[pos++] = (converted >> 16) & 0xFF;
+        out[pos++] = (converted >> 24) & 0xFF;
+    }
+    
+    // Constants
+    // R_LUA_TSTRING = 4, R_LUA_TNUMBER = 3
+    for (int i = 0; i < 7; i++) {
+        if (pos + 1 > out_size) return 0;
+        out[pos++] = 4; // R_LUA_TSTRING
+        int slen = strlen(strings[i]);
+        len = encode_varint(slen, varint_buf);
+        if (pos + len + slen > out_size) return 0;
+        memcpy(out + pos, varint_buf, len); pos += len;
+        memcpy(out + pos, strings[i], slen); pos += slen;
+    }
+    // Number 59.0
+    if (pos + 1 + 8 > out_size) return 0;
+    out[pos++] = 3; // R_LUA_TNUMBER
+    double num = 59.0;
+    memcpy(out + pos, &num, 8); pos += 8;
+    
+    return pos;
+}
+
 // Hardcoded WalkSpeed bytecode (standard Lua 5.1, for testing)
 // game:GetService("Players").LocalPlayer.Character.Humanoid.WalkSpeed = 59
 static const unsigned char walkspeed_luac[] = {
@@ -174,18 +255,23 @@ void hook_lua_pushnumber(lua_State* L, double n) {
     // If there's pending code, execute it NOW on the game thread
     // Use atomic compare-and-swap to claim it
     if (__sync_bool_compare_and_swap(&g_pending, 1, 0)) {
-        // TEST: Use hardcoded WalkSpeed bytecode instead of user code
-        // This bypasses the need for a Lua compiler
+        // Use RC7-format bytecode chunk
         if (g_load && g_pcall) {
-            struct LoadS ls;
-            ls.s = (const char*)walkspeed_luac;
-            ls.size = walkspeed_luac_len;
-            int load_status = g_load(g_L, (void*)my_reader, &ls, "walkspeed");
-            if (load_status != 0) {
-                g_last_result = 1000 + load_status;
+            unsigned char chunk[1024];
+            int chunk_size = build_walkspeed_chunk(chunk, sizeof(chunk));
+            if (chunk_size > 0) {
+                struct LoadS ls;
+                ls.s = (const char*)chunk;
+                ls.size = chunk_size;
+                int load_status = g_load(g_L, (void*)my_reader, &ls, "walkspeed");
+                if (load_status != 0) {
+                    g_last_result = 1000 + load_status;
+                } else {
+                    int cs = g_pcall(g_L, 0, 0, 0);
+                    g_last_result = cs;
+                }
             } else {
-                int cs = g_pcall(g_L, 0, 0, 0);
-                g_last_result = cs;
+                g_last_result = 1000 + 99; // Chunk build failed
             }
         }
     }
