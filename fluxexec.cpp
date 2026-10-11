@@ -77,7 +77,7 @@ static bool install_hook(uintptr_t target) {
         return false;
     }
     uint32_t* ip = (uint32_t*)target;
-    ip[0] = 0x58000060; // ldr x16, #12
+    ip[0] = 0x58000070; // ldr x16, #12 (Rt=16, imm19=3)
     ip[1] = 0xD61F0200; // br x16
     ip[2] = 0xD503201F; // nop
     *(uintptr_t*)(ip + 3) = (uintptr_t)hook_lua_pushnumber;
