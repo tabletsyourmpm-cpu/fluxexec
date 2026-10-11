@@ -99,10 +99,19 @@ static bool resolve() {
         LOGE("libroblox.so not found");
         return false;
     }
-    LOGI("libroblox.so base=%p", (void*)g_roblox_base);
-    // DIAGNOSTIC ONLY: don't install hook yet, just verify base
-    // TODO: re-enable hook once base is confirmed
-    return false;
+    uintptr_t target = g_roblox_base + 0x76a254;
+    LOGI("Target lua_pushnumber at %p", (void*)target);
+    
+    // SAFETY: verify the bytes match expected (ldr x2, [x0, #0x20] = 02 10 40 F9)
+    uint8_t* p = (uint8_t*)target;
+    if (p[0] != 0x02 || p[1] != 0x10 || p[2] != 0x40 || p[3] != 0xF9) {
+        LOGE("Byte verification failed at %p: %02x %02x %02x %02x",
+             (void*)target, p[0], p[1], p[2], p[3]);
+        return false;
+    }
+    LOGI("Bytes verified, installing hook...");
+    
+    return install_hook(target);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -110,14 +119,14 @@ Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, js
     const char* code = env->GetStringUTFChars(jcode, nullptr);
     std::string result;
     
-    dl_iterate_phdr(phdr_cb, nullptr);
-    if (!g_roblox_base) {
-        result = "[fluxexec] libroblox.so not found in process";
+    if (!resolve()) {
+        result = "[fluxexec] Hook not installed (see logcat)";
+    } else if (!g_L) {
+        result = "[fluxexec] Hook active, waiting for lua_State*...";
+        LOGI("Hook installed, waiting for game to call lua_pushnumber...");
     } else {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "[fluxexec] base=%p (diagnostic, hook disabled)", (void*)g_roblox_base);
-        result = buf;
-        LOGI("Diagnostic: base=%p", (void*)g_roblox_base);
+        result = "[fluxexec] Got lua_State*! Need pcall+loadstring.";
+        LOGI("Have state %p", (void*)g_L);
     }
     
     env->ReleaseStringUTFChars(jcode, code);
