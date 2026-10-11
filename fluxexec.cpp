@@ -95,16 +95,14 @@ static bool install_hook(uintptr_t target_addr) {
 static bool resolve() {
     if (g_L) return true;
     dl_iterate_phdr(phdr_cb, nullptr);
-    if (!g_roblox_base) return false;
-    
-    // lua_pushnumber at file offset 0x76a254
-    // At runtime: base + 0x76a254 (if base is 0, else base + offset)
-    // Actually, the file offset != vaddr if PIE. Use dladdr to get actual.
-    // For now, assume base+offset (libroblox.so is likely non-PIE or we get base from phdr)
-    uintptr_t target = g_roblox_base + 0x76a254;
-    LOGI("Hooking lua_pushnumber at %p (base %p)", (void*)target, (void*)g_roblox_base);
-    
-    return install_hook(target);
+    if (!g_roblox_base) {
+        LOGE("libroblox.so not found");
+        return false;
+    }
+    LOGI("libroblox.so base=%p", (void*)g_roblox_base);
+    // DIAGNOSTIC ONLY: don't install hook yet, just verify base
+    // TODO: re-enable hook once base is confirmed
+    return false;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -112,14 +110,14 @@ Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, js
     const char* code = env->GetStringUTFChars(jcode, nullptr);
     std::string result;
     
-    if (!resolve()) {
-        result = "[fluxexec] Hook not installed";
-    } else if (!g_L) {
-        result = "[fluxexec] Waiting for lua_State* (play the game, trigger a push)";
-        LOGI("Hook active, waiting for game to call lua_pushnumber...");
+    dl_iterate_phdr(phdr_cb, nullptr);
+    if (!g_roblox_base) {
+        result = "[fluxexec] libroblox.so not found in process";
     } else {
-        result = "[fluxexec] Got lua_State*! Now need luaL_loadstring+lua_pcall addresses.";
-        LOGI("Have state %p, need API addresses", (void*)g_L);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[fluxexec] base=%p (diagnostic, hook disabled)", (void*)g_roblox_base);
+        result = buf;
+        LOGI("Diagnostic: base=%p", (void*)g_roblox_base);
     }
     
     env->ReleaseStringUTFChars(jcode, code);
