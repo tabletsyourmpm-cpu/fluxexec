@@ -31,6 +31,75 @@ static int g_last_result = -999;
 #define OFF_LUA_LOAD        0x76b01c  // Direct lua_load, bypass luaL_loadbuffer
 #define OFF_LUA_PCALL       0x76a618
 
+// RC7 bytecode conversion - Roblox custom opcode mapping
+// Standard Lua 5.1 opcode -> Roblox opcode
+static const unsigned char RBXL_OPNAMES[] = {
+    0x06, // MOVE 0
+    0x04, // LOADK 1
+    0x00, // LOADBOOL 2
+    0x07, // LOADNIL 3
+    0x02, // GETUPVAL 4
+    0x08, // GETGLOBAL 5
+    0x01, // GETTABLE 6
+    0x03, // SETGLOBAL 7
+    0x05, // SETUPVAL 8
+    0x0F, // SETTABLE 9
+    0x0D, // NEWTABLE 10
+    0x09, // SELF 11
+    0x10, // ADD 12
+    0x0B, // SUB 13
+    0x11, // MUL 14
+    0x0A, // DIV 15
+    0x0C, // MOD 16
+    0x0E, // POW 17
+    0x18, // UNM 18
+    0x16, // NOT 19
+    0x12, // LEN 20
+    0x19, // CONCAT 21
+    0x14, // JMP 22
+    0x1A, // EQ 23
+    0x13, // LT 24
+    0x15, // LE 25
+    0x17, // TEST 26
+    0x21, // TESTSET 27
+    0x1F, // CALL 28
+    0x1F, // TAILCALL 29
+    0x22, // RETURN 30
+    0x1D, // FORLOOP 31
+    0x23, // FORPREP 32
+    0x1C, // TFORLOOP 33
+    0x1E, // SETLIST 34
+    0x20, // CLOSE 35
+    0x25, // CLOSURE 36
+    0x24, // VARARG 37
+};
+
+// Opcode modes: 0=ABC, 1=ABx, 2=AsBx
+static const unsigned char OP_MODES[] = {
+    0,1,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,2,2,0,0,0,1,0
+};
+
+static unsigned int ConvertOp(unsigned int inst) {
+    unsigned int opcode = inst & 0x3F;
+    if (opcode >= 38) return 0;
+    unsigned int rb_opcode = RBXL_OPNAMES[opcode];
+    unsigned int mode = OP_MODES[opcode];
+    unsigned int A = (inst >> 6) & 0xFF;
+    unsigned int result;
+    if (mode == 0) { // ABC
+        unsigned int B = (inst >> 23) & 0x1FF;
+        unsigned int C = (inst >> 14) & 0x1FF;
+        if (opcode == 0) C = 1; // MOVE special case from RC7
+        // Roblox: opcode at 26, A at 18, C at 9, B at 0
+        result = (rb_opcode << 26) | (A << 18) | (C << 9) | B;
+    } else { // ABx/AsBx
+        unsigned int Bx = (inst >> 14) & 0x3FFFF;
+        // Roblox: opcode at 26, A at 18, Bx at 0
+        result = (rb_opcode << 26) | (A << 18) | Bx;
+    }
+    return result;
+}
+
 // Hardcoded WalkSpeed bytecode (standard Lua 5.1, for testing)
 // game:GetService("Players").LocalPlayer.Character.Humanoid.WalkSpeed = 59
 static const unsigned char walkspeed_luac[] = {
