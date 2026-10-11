@@ -1,130 +1,112 @@
-// libfluxexec.so - Flux Executor native bridge for Better16 (2016 Roblox client)
-// Built against 2016 source refs (Aya). Does NOT modify libroblox.so.
-//
-// Execution path (from 2016 source):
-//   LogService::executeServerScript (DataModel/LogService.cpp:360)
-//     -> ScriptContext::executeInNewThread (Script/ScriptContext.cpp:1346)
-//        -> luaL_loadstring + lua_pcall on the ScriptContext's lua_State*
-//
-// We pattern-scan for ScriptContext::executeInNewThread in libroblox.so
-// and call it directly with (GameScript identity, source, "console").
-//
-// Java side (OverlayService):
-//   static { System.loadLibrary("fluxexec"); }
-//   private native String nativeExecute(String code);
-//
-// Build (NDK r25+, ARM64):
-//   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++ \
-//     -shared -fPIC -O2 -o libfluxexec.so fluxexec.cpp -ldl -llog
+// libfluxexec.so - Lua state capturer via inline hook
+// Hooks lua_pushnumber to capture the lua_State*.
 
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
 #include <string>
 #include <cstdint>
+#include <link.h>
+#include <cstring>
+#include <elf.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define LOG_TAG "FluxExec"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// ---------------------------------------------------------------------------
-// Lua C API types (from 2016 source: lua.h, luaux.h)
-// We resolve these at runtime via pattern scanning since libroblox.so
-// hides its symbols (no dynamic exports for lua_*).
-// ---------------------------------------------------------------------------
 struct lua_State; // opaque
 
-typedef int (*luaL_loadstring_fn)(lua_State* L, const char* s);
-typedef int (*lua_pcall_fn)(lua_State* L, int nargs, int nresults, int errfunc);
-typedef const char* (*lua_tolstring_fn)(lua_State* L, int idx, size_t* len);
-typedef void (*lua_settop_fn)(lua_State* L, int idx);
+static lua_State* g_L = nullptr;
+static uintptr_t g_roblox_base = 0;
 
-static luaL_loadstring_fn p_luaL_loadstring = nullptr;
-static lua_pcall_fn       p_lua_pcall       = nullptr;
-static lua_tolstring_fn   p_lua_tolstring   = nullptr;
-static lua_settop_fn      p_lua_settop      = nullptr;
-static lua_State*         g_L               = nullptr;
+// Original lua_pushnumber bytes (16 bytes = 4 instructions)
+static uint8_t g_orig_bytes[16];
+static uintptr_t g_hook_addr = 0;
 
-// ---------------------------------------------------------------------------
-// Pattern scan libroblox.so for the Lua API.
-// The 2016 source gives us the function bodies; we match distinctive
-// instruction sequences. Patterns are filled in after dumping the
-// actual libroblox.so from the Better16 APK.
-// ---------------------------------------------------------------------------
-static uintptr_t find_pattern(uintptr_t base, size_t size,
-                              const uint8_t* pat, const char* mask) {
-    size_t plen = 0;
-    while (mask[plen]) plen++;
-    for (size_t i = 0; i + plen <= size; i++) {
-        bool ok = true;
-        for (size_t j = 0; j < plen; j++) {
-            if (mask[j] == 'x' && ((uint8_t*)(base + i))[j] != pat[j]) { ok = false; break; }
-        }
-        if (ok) return base + i;
+// Our hook function - called instead of lua_pushnumber
+// x0 = L (lua_State*), d0 = number
+extern "C" void hook_lua_pushnumber(lua_State* L, double n) {
+    if (!g_L) {
+        g_L = L;
+        LOGI("Captured lua_State* = %p", (void*)L);
+    }
+    // Call original: we need to execute the saved instructions
+    // For now, just log (TODO: implement trampoline)
+    LOGI("lua_pushnumber called with L=%p, n=%f", (void*)L, n);
+}
+
+static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
+    if (info->dlpi_name && strstr(info->dlpi_name, "libroblox.so")) {
+        g_roblox_base = info->dlpi_addr;
+        return 1;
     }
     return 0;
 }
 
-// TODO: fill these from the real libroblox.so (Better16 ARM64 build).
-// Dump with: llvm-objdump -d libroblox.so | grep -A30 "<luaL_loadstring>:"
-// then convert the prologue bytes to a pattern.
-static bool resolve_lua_api() {
-    if (p_luaL_loadstring) return true; // already resolved
-
-    void* h = dlopen("libroblox.so", RTLD_NOLOAD);
-    if (!h) { LOGE("libroblox.so not loaded"); return false; }
-
-    // TODO: implement find_pattern over the .text segment and set:
-    //   p_luaL_loadstring, p_lua_pcall, p_lua_tolstring, p_lua_settop
-    // TODO: locate the global ScriptContext -> lua_State* (see 2016
-    //   source: RBX::ScriptContext::getGlobalState or the DataModel's
-    //   script context singleton).
-
-    LOGE("resolve_lua_api: patterns not yet filled in for this build");
-    return false;
+// Install inline hook at target_addr
+static bool install_hook(uintptr_t target_addr) {
+    // ARM64: we need to overwrite with a branch to our hook
+    // Simplest: LDR x16, #8; BR x16; <8-byte addr>
+    // That's 16 bytes (4 instructions)
+    
+    uintptr_t page = target_addr & ~(0xFFF);
+    if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("mprotect failed");
+        return false;
+    }
+    
+    // Save original
+    memcpy(g_orig_bytes, (void*)target_addr, 16);
+    g_hook_addr = target_addr;
+    
+    // Write: ldr x16, #8; br x16; .quad hook_addr
+    uint32_t* p = (uint32_t*)target_addr;
+    p[0] = 0x58000050; // ldr x16, #8 (PC+8)
+    p[1] = 0xD61F0200; // br x16
+    *(uintptr_t*)(p + 2) = (uintptr_t)hook_lua_pushnumber;
+    
+    __builtin___clear_cache((void*)target_addr, (void*)(target_addr + 16));
+    LOGI("Hook installed at %p", (void*)target_addr);
+    return true;
 }
 
-// ---------------------------------------------------------------------------
-// JNI entry point called from OverlayService.execute button.
-// Returns the script's output or an error string for display.
-// ---------------------------------------------------------------------------
+static bool resolve() {
+    if (g_L) return true;
+    dl_iterate_phdr(phdr_cb, nullptr);
+    if (!g_roblox_base) return false;
+    
+    // lua_pushnumber at file offset 0x76a254
+    // At runtime: base + 0x76a254 (if base is 0, else base + offset)
+    // Actually, the file offset != vaddr if PIE. Use dladdr to get actual.
+    // For now, assume base+offset (libroblox.so is likely non-PIE or we get base from phdr)
+    uintptr_t target = g_roblox_base + 0x76a254;
+    LOGI("Hooking lua_pushnumber at %p (base %p)", (void*)target, (void*)g_roblox_base);
+    
+    return install_hook(target);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_better16_executor_OverlayService_nativeExecute(
-        JNIEnv* env, jobject /*thiz*/, jstring jcode) {
+Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, jstring jcode) {
     const char* code = env->GetStringUTFChars(jcode, nullptr);
     std::string result;
-
-    if (!resolve_lua_api() || !g_L) {
-        result = "[fluxexec] Lua API not resolved yet (patterns pending)";
-        LOGE("%s", result.c_str());
+    
+    if (!resolve()) {
+        result = "[fluxexec] Hook not installed";
+    } else if (!g_L) {
+        result = "[fluxexec] Waiting for lua_State* (play the game, trigger a push)";
+        LOGI("Hook active, waiting for game to call lua_pushnumber...");
     } else {
-        // Load the chunk
-        int status = p_luaL_loadstring(g_L, code);
-        if (status != 0) {
-            size_t len = 0;
-            const char* err = p_lua_tolstring(g_L, -1, &len);
-            result = std::string("[load error] ") + (err ? std::string(err, len) : "?");
-            p_lua_settop(g_L, 0);
-        } else {
-            // Run it
-            status = p_lua_pcall(g_L, 0, 0, 0);
-            if (status != 0) {
-                size_t len = 0;
-                const char* err = p_lua_tolstring(g_L, -1, &len);
-                result = std::string("[run error] ") + (err ? std::string(err, len) : "?");
-                p_lua_settop(g_L, 0);
-            } else {
-                result = "[executed OK]";
-            }
-        }
+        result = "[fluxexec] Got lua_State*! Now need luaL_loadstring+lua_pcall addresses.";
+        LOGI("Have state %p, need API addresses", (void*)g_L);
     }
-
+    
     env->ReleaseStringUTFChars(jcode, code);
     return env->NewStringUTF(result.c_str());
 }
 
-// Run on library load: try to resolve early so the first Execute is fast.
-__attribute__((constructor)) static void fluxexec_init() {
-    LOGI("libfluxexec loaded, resolving Lua API...");
-    resolve_lua_api();
+__attribute__((constructor)) static void init() {
+    LOGI("libfluxexec hook loaded");
+    resolve();
 }
