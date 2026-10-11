@@ -26,16 +26,29 @@ static char g_pending_code[4096];
 static volatile int g_pending = 0; // 0=none, 1=ready (atomic)
 static int g_last_result = -999;
 
-// Offsets in libroblox.so (file offsets = vaddr offsets)
+// Offsets in libroblox.so
 #define OFF_LUA_PUSHNUMBER  0x76a254
-#define OFF_LUA_L_LOADBUFFER 0x7694b4  // Real one (0x769460 was the modified stub)
+#define OFF_LUA_LOAD        0x76b01c  // Direct lua_load, bypass luaL_loadbuffer
 #define OFF_LUA_PCALL       0x76a618
 
-// Function pointers (resolved at runtime)
-typedef int (*luaL_loadbuffer_fn)(lua_State* L, const char* buff, size_t size, const char* name);
+// Function pointers
+typedef int (*lua_load_fn)(lua_State* L, void* reader, void* data, const char* chunkname);
 typedef int (*lua_pcall_fn)(lua_State* L, int nargs, int nresults, int errfunc);
-static luaL_loadbuffer_fn g_loadbuffer = nullptr;
+static lua_load_fn g_load = nullptr;
 static lua_pcall_fn g_pcall = nullptr;
+
+// LoadS struct for the reader
+struct LoadS { const char* s; size_t size; };
+
+// Custom reader function (replaces getS)
+static const char* my_reader(lua_State* L, void* ud, size_t* size) {
+    (void)L;
+    struct LoadS* ls = (struct LoadS*)ud;
+    if (ls->size == 0) return NULL;
+    *size = ls->size;
+    ls->size = 0;
+    return ls->s;
+}
 
 static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libroblox.so")) {
@@ -55,8 +68,8 @@ void hook_lua_pushnumber(lua_State* L, double n) {
     // Always update g_L (not just first time) - the state changes per game session!
     // Also re-resolve function pointers in case base changed (shouldn't, but safe)
     g_L = saved_L;
-    if (g_roblox_base && (!g_loadbuffer || !g_pcall)) {
-        g_loadbuffer = (luaL_loadbuffer_fn)(g_roblox_base + OFF_LUA_L_LOADBUFFER);
+    if (g_roblox_base && (!g_load || !g_pcall)) {
+        g_load = (lua_load_fn)(g_roblox_base + OFF_LUA_LOAD);
         g_pcall = (lua_pcall_fn)(g_roblox_base + OFF_LUA_PCALL);
     }
     // If there's pending code, execute it NOW on the game thread
@@ -67,10 +80,13 @@ void hook_lua_pushnumber(lua_State* L, double n) {
         size_t len = strlen(g_pending_code);
         if (len < sizeof(local_code)) {
             memcpy(local_code, g_pending_code, len + 1);
-            if (g_loadbuffer && g_pcall) {
-                int ls = g_loadbuffer(g_L, local_code, len, "fluxexec");
-                if (ls != 0) {
-                    g_last_result = 1000 + ls;
+            if (g_load && g_pcall) {
+                struct LoadS ls;
+                ls.s = local_code;
+                ls.size = len;
+                int load_status = g_load(g_L, (void*)my_reader, &ls, "fluxexec");
+                if (load_status != 0) {
+                    g_last_result = 1000 + load_status;
                 } else {
                     int cs = g_pcall(g_L, 0, 0, 0);
                     g_last_result = cs;
