@@ -52,12 +52,12 @@ void hook_lua_pushnumber(lua_State* L, double n) {
         "mov %0, x0\n"
         "fmov %d1, d0\n"
         : "=r"(saved_L), "=w"(saved_n) : : );
-    if (!g_L) {
-        g_L = saved_L;
-        if (g_roblox_base) {
-            g_loadbuffer = (luaL_loadbuffer_fn)(g_roblox_base + OFF_LUA_L_LOADBUFFER);
-            g_pcall = (lua_pcall_fn)(g_roblox_base + OFF_LUA_PCALL);
-        }
+    // Always update g_L (not just first time) - the state changes per game session!
+    // Also re-resolve function pointers in case base changed (shouldn't, but safe)
+    g_L = saved_L;
+    if (g_roblox_base && (!g_loadbuffer || !g_pcall)) {
+        g_loadbuffer = (luaL_loadbuffer_fn)(g_roblox_base + OFF_LUA_L_LOADBUFFER);
+        g_pcall = (lua_pcall_fn)(g_roblox_base + OFF_LUA_PCALL);
     }
     // If there's pending code, execute it NOW on the game thread
     // Use atomic compare-and-swap to claim it
