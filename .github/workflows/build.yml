@@ -13,11 +13,14 @@ jobs:
 
       - name: Install NDK
         run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
           sdkmanager "ndk;25.2.9519653"
           ls $ANDROID_HOME/ndk/
 
       - name: Build ARM64
         run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
           NDK=$ANDROID_HOME/ndk/25.2.9519653
           CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++
           $CLANG -shared -fPIC -O2 \
