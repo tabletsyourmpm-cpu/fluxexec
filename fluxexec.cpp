@@ -38,26 +38,34 @@ static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
 //   str x1, [x0, #0x20]
 //   ret
 void hook_lua_pushnumber(lua_State* L, double n) {
-    if (!g_L) {
-        g_L = L;
-        LOGI("Captured lua_State*=%p", (void*)L);
-    }
-    // Manually execute the original 8 instructions using inline asm
-    // x0=L (already), d0=n (already)
-    // We use x1, x2, x3 as scratch (caller-saved, safe)
+    // Save L BEFORE any function calls (LOGI clobbers x0/d0!)
+    // Use inline asm to capture x0 directly without C interference
+    lua_State* saved_L;
+    double saved_n;
     __asm__ volatile(
-        "ldr x2, [x0, #0x20]\n"
+        "mov %0, x0\n"
+        "fmov %d1, d0\n"
+        : "=r"(saved_L), "=w"(saved_n)
+        :
+        :
+    );
+    if (!g_L) {
+        g_L = saved_L;
+    }
+    // Manually execute the original 8 instructions
+    // Use saved_L and saved_n (not x0/d0 which may be clobbered)
+    __asm__ volatile(
+        "ldr x2, [%0, #0x20]\n"
         "mov w3, #2\n"
-        "str d0, [x2]\n"
-        "ldr x1, [x0, #0x20]\n"
+        "str %d1, [x2]\n"
+        "ldr x1, [%0, #0x20]\n"
         "str w3, [x2, #8]\n"
         "add x1, x1, #0x10\n"
-        "str x1, [x0, #0x20]\n"
-        ::: "x1", "x2", "x3", "memory"
+        "str x1, [%0, #0x20]\n"
+        :: "r"(saved_L), "w"(saved_n)
+        : "x1", "x2", "x3", "memory"
     );
-    // Return normally - C epilogue handles stack correctly
-    // The hook stays installed; subsequent calls will also be intercepted
-    // but that's fine (we already have g_L, just re-execute)
+    // Return normally
 }
 
 static bool install_hook(uintptr_t target) {
