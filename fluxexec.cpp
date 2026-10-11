@@ -24,6 +24,7 @@ static uintptr_t g_roblox_base = 0;
 // Original lua_pushnumber bytes (16 bytes = 4 instructions)
 static uint8_t g_orig_bytes[16];
 static uintptr_t g_hook_addr = 0;
+static void* g_trampoline = nullptr;
 
 // Our hook function - called instead of lua_pushnumber
 // x0 = L (lua_State*), d0 = number
@@ -32,9 +33,11 @@ extern "C" void hook_lua_pushnumber(lua_State* L, double n) {
         g_L = L;
         LOGI("Captured lua_State* = %p", (void*)L);
     }
-    // Call original: we need to execute the saved instructions
-    // For now, just log (TODO: implement trampoline)
-    LOGI("lua_pushnumber called with L=%p, n=%f", (void*)L, n);
+    // Call original via trampoline
+    if (g_trampoline) {
+        typedef void (*orig_fn)(lua_State*, double);
+        ((orig_fn)g_trampoline)(L, n);
+    }
 }
 
 static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
@@ -47,10 +50,6 @@ static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
 
 // Install inline hook at target_addr
 static bool install_hook(uintptr_t target_addr) {
-    // ARM64: we need to overwrite with a branch to our hook
-    // Simplest: LDR x16, #8; BR x16; <8-byte addr>
-    // That's 16 bytes (4 instructions)
-    
     uintptr_t page = target_addr & ~(0xFFF);
     if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         LOGE("mprotect failed");
@@ -61,14 +60,28 @@ static bool install_hook(uintptr_t target_addr) {
     memcpy(g_orig_bytes, (void*)target_addr, 16);
     g_hook_addr = target_addr;
     
-    // Write: ldr x16, #8; br x16; .quad hook_addr
+    // Build trampoline: orig 4 insns + branch to target+16
+    g_trampoline = mmap(NULL, 32, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_trampoline == MAP_FAILED) {
+        LOGE("mmap failed");
+        return false;
+    }
+    memcpy(g_trampoline, g_orig_bytes, 16);
+    uintptr_t tramp_addr = (uintptr_t)g_trampoline;
+    int64_t offset = (int64_t)(target_addr + 16) - (int64_t)(tramp_addr + 16);
+    uint32_t br_insn = 0x14000000 | ((uint32_t)((offset >> 2) & 0x3FFFFFF));
+    ((uint32_t*)g_trampoline)[4] = br_insn;
+    __builtin___clear_cache((char*)g_trampoline, (char*)g_trampoline + 20);
+    
+    // Write hook: ldr x16, #8; br x16; .quad hook_addr
     uint32_t* p = (uint32_t*)target_addr;
-    p[0] = 0x58000050; // ldr x16, #8 (PC+8)
+    p[0] = 0x58000050; // ldr x16, #8
     p[1] = 0xD61F0200; // br x16
     *(uintptr_t*)(p + 2) = (uintptr_t)hook_lua_pushnumber;
     
     __builtin___clear_cache((char*)target_addr, (char*)(target_addr + 16));
-    LOGI("Hook installed at %p", (void*)target_addr);
+    LOGI("Hook installed at %p with trampoline %p", (void*)target_addr, g_trampoline);
     return true;
 }
 
