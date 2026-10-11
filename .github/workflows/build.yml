@@ -24,6 +24,7 @@ jobs:
           NDK=$ANDROID_HOME/ndk/25.2.9519653
           CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++
           $CLANG -shared -fPIC -O2 \
+            -static-libstdc++ \
             -o libfluxexec.so fluxexec.cpp \
             -ldl -llog
           file libfluxexec.so
