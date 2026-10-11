@@ -11,6 +11,7 @@
 #include <elf.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define LOG_TAG "FluxExec"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -51,8 +52,9 @@ static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
 // Install inline hook at target_addr
 static bool install_hook(uintptr_t target_addr) {
     uintptr_t page = target_addr & ~(0xFFF);
-    if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("mprotect failed");
+    // W^X: first make writable (no exec), then after writing, make exec (no write)
+    if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("mprotect RW failed: %d", errno);
         return false;
     }
     
@@ -60,11 +62,12 @@ static bool install_hook(uintptr_t target_addr) {
     memcpy(g_orig_bytes, (void*)target_addr, 16);
     g_hook_addr = target_addr;
     
-    // Build trampoline: orig 4 insns + branch to target+16
-    g_trampoline = mmap(NULL, 32, PROT_READ | PROT_WRITE | PROT_EXEC,
+    // Build trampoline: mmap RW, copy, then mprotect to RX
+    g_trampoline = mmap(NULL, 32, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_trampoline == MAP_FAILED) {
         LOGE("mmap failed");
+        mprotect((void*)page, 0x1000, PROT_READ | PROT_EXEC);
         return false;
     }
     memcpy(g_trampoline, g_orig_bytes, 16);
@@ -72,6 +75,8 @@ static bool install_hook(uintptr_t target_addr) {
     int64_t offset = (int64_t)(target_addr + 16) - (int64_t)(tramp_addr + 16);
     uint32_t br_insn = 0x14000000 | ((uint32_t)((offset >> 2) & 0x3FFFFFF));
     ((uint32_t*)g_trampoline)[4] = br_insn;
+    // Make trampoline executable (remove write)
+    mprotect(g_trampoline, 32, PROT_READ | PROT_EXEC);
     __builtin___clear_cache((char*)g_trampoline, (char*)g_trampoline + 20);
     
     // Write hook: ldr x16, #8; br x16; .quad hook_addr
@@ -80,6 +85,8 @@ static bool install_hook(uintptr_t target_addr) {
     p[1] = 0xD61F0200; // br x16
     *(uintptr_t*)(p + 2) = (uintptr_t)hook_lua_pushnumber;
     
+    // Make target executable again (remove write), clear cache
+    mprotect((void*)page, 0x1000, PROT_READ | PROT_EXEC);
     __builtin___clear_cache((char*)target_addr, (char*)(target_addr + 16));
     LOGI("Hook installed at %p with trampoline %p", (void*)target_addr, g_trampoline);
     return true;
