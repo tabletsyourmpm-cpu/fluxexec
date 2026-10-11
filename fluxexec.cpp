@@ -1,4 +1,6 @@
-// libfluxexec.so - Hook inlines original instructions, returns normally
+// libfluxexec.so - Full Lua executor
+// Hooks lua_pushnumber to capture lua_State*, then executes via luaL_loadbuffer + lua_pcall
+
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
@@ -19,6 +21,22 @@ static lua_State* g_L = nullptr;
 static uintptr_t g_roblox_base = 0;
 static bool g_hooked = false;
 
+// Pending execution (set by UI thread, consumed by game thread in hook)
+static char g_pending_code[4096];
+static bool g_pending = false;
+static int g_last_result = -999; // -999=none, 0=ok, else error
+
+// Offsets in libroblox.so (file offsets = vaddr offsets)
+#define OFF_LUA_PUSHNUMBER  0x76a254
+#define OFF_LUA_L_LOADBUFFER 0x769460
+#define OFF_LUA_PCALL       0x76a618
+
+// Function pointers (resolved at runtime)
+typedef int (*luaL_loadbuffer_fn)(lua_State* L, const char* buff, size_t size, const char* name);
+typedef int (*lua_pcall_fn)(lua_State* L, int nargs, int nresults, int errfunc);
+static luaL_loadbuffer_fn g_loadbuffer = nullptr;
+static lua_pcall_fn g_pcall = nullptr;
+
 static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libroblox.so")) {
         g_roblox_base = info->dlpi_addr;
@@ -27,33 +45,31 @@ static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
     return 0;
 }
 
-// Hook: capture L, then manually execute the 8 original instructions
-// Original at 0x76a254:
-//   ldr x2, [x0, #0x20]
-//   mov w3, #2
-//   str d0, [x2]
-//   ldr x1, [x0, #0x20]
-//   str w3, [x2, #8]
-//   add x1, x1, #0x10
-//   str x1, [x0, #0x20]
-//   ret
 void hook_lua_pushnumber(lua_State* L, double n) {
-    // Save L BEFORE any function calls (LOGI clobbers x0/d0!)
-    // Use inline asm to capture x0 directly without C interference
     lua_State* saved_L;
     double saved_n;
     __asm__ volatile(
         "mov %0, x0\n"
         "fmov %d1, d0\n"
-        : "=r"(saved_L), "=w"(saved_n)
-        :
-        :
-    );
+        : "=r"(saved_L), "=w"(saved_n) : : );
     if (!g_L) {
         g_L = saved_L;
+        if (g_roblox_base) {
+            g_loadbuffer = (luaL_loadbuffer_fn)(g_roblox_base + OFF_LUA_L_LOADBUFFER);
+            g_pcall = (lua_pcall_fn)(g_roblox_base + OFF_LUA_PCALL);
+        }
     }
-    // Manually execute the original 8 instructions
-    // Use saved_L and saved_n (not x0/d0 which may be clobbered)
+    // If there's pending code, execute it NOW on the game thread
+    if (g_pending && g_loadbuffer && g_pcall) {
+        g_pending = false;
+        int ls = g_loadbuffer(g_L, g_pending_code, strlen(g_pending_code), "fluxexec");
+        if (ls != 0) {
+            g_last_result = 1000 + ls; // load error
+        } else {
+            int cs = g_pcall(g_L, 0, 0, 0);
+            g_last_result = cs; // 0=ok
+        }
+    }
     __asm__ volatile(
         "ldr x2, [%0, #0x20]\n"
         "mov w3, #2\n"
@@ -65,7 +81,6 @@ void hook_lua_pushnumber(lua_State* L, double n) {
         :: "r"(saved_L), "w"(saved_n)
         : "x1", "x2", "x3", "memory"
     );
-    // Return normally
 }
 
 static bool install_hook(uintptr_t target) {
@@ -77,7 +92,7 @@ static bool install_hook(uintptr_t target) {
         return false;
     }
     uint32_t* ip = (uint32_t*)target;
-    ip[0] = 0x58000070; // ldr x16, #12 (Rt=16, imm19=3)
+    ip[0] = 0x58000070; // ldr x16, #12
     ip[1] = 0xD61F0200; // br x16
     ip[2] = 0xD503201F; // nop
     *(uintptr_t*)(ip + 3) = (uintptr_t)hook_lua_pushnumber;
@@ -91,23 +106,40 @@ static bool install_hook(uintptr_t target) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, jstring jcode) {
     const char* code = env->GetStringUTFChars(jcode, nullptr);
+    size_t code_len = strlen(code);
     std::string result;
-    if (g_L) {
-        result = "[fluxexec] Have lua_State*!";
-    } else {
-        dl_iterate_phdr(phdr_cb, nullptr);
-        if (!g_roblox_base) {
-            result = "[fluxexec] libroblox not found";
-        } else if (!g_hooked) {
-            if (install_hook(g_roblox_base + 0x76a254)) {
-                result = "[fluxexec] Hook installed";
+
+    dl_iterate_phdr(phdr_cb, nullptr);
+    if (!g_roblox_base) {
+        result = "[fluxexec] libroblox not found";
+    } else if (!g_L) {
+        if (!g_hooked) {
+            if (install_hook(g_roblox_base + OFF_LUA_PUSHNUMBER)) {
+                result = "[fluxexec] Hook installed, waiting for lua_State*...";
             } else {
-                result = "[fluxexec] Hook failed";
+                result = "[fluxexec] Hook install failed";
             }
         } else {
-            result = "[fluxexec] Waiting...";
+            result = "[fluxexec] Waiting for lua_State*...";
+        }
+    } else {
+        // Have state. Queue code for game-thread execution.
+        if (g_last_result != -999 && !g_pending) {
+            // Previous execution finished, report it
+            if (g_last_result == 0) result = "[fluxexec] Executed OK";
+            else if (g_last_result >= 1000) result = "[fluxexec] Load error: " + std::to_string(g_last_result - 1000);
+            else result = "[fluxexec] Pcall error: " + std::to_string(g_last_result);
+            g_last_result = -999;
+        } else if (code_len < sizeof(g_pending_code)) {
+            memcpy(g_pending_code, code, code_len);
+            g_pending_code[code_len] = '\0';
+            g_pending = true;
+            result = "[fluxexec] Queued, press Execute again for result";
+        } else {
+            result = "[fluxexec] Code too long";
         }
     }
+
     env->ReleaseStringUTFChars(jcode, code);
     return env->NewStringUTF(result.c_str());
 }
