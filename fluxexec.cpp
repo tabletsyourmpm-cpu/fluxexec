@@ -21,10 +21,10 @@ static lua_State* g_L = nullptr;
 static uintptr_t g_roblox_base = 0;
 static bool g_hooked = false;
 
-// Pending execution (set by UI thread, consumed by game thread in hook)
+// Pending execution - use atomic flag for synchronization
 static char g_pending_code[4096];
-static bool g_pending = false;
-static int g_last_result = -999; // -999=none, 0=ok, else error
+static volatile int g_pending = 0; // 0=none, 1=ready (atomic)
+static int g_last_result = -999;
 
 // Offsets in libroblox.so (file offsets = vaddr offsets)
 #define OFF_LUA_PUSHNUMBER  0x76a254
@@ -60,14 +60,22 @@ void hook_lua_pushnumber(lua_State* L, double n) {
         }
     }
     // If there's pending code, execute it NOW on the game thread
-    if (g_pending && g_loadbuffer && g_pcall) {
-        g_pending = false;
-        int ls = g_loadbuffer(g_L, g_pending_code, strlen(g_pending_code), "fluxexec");
-        if (ls != 0) {
-            g_last_result = 1000 + ls; // load error
-        } else {
-            int cs = g_pcall(g_L, 0, 0, 0);
-            g_last_result = cs; // 0=ok
+    // Use atomic compare-and-swap to claim it
+    if (__sync_bool_compare_and_swap(&g_pending, 1, 0)) {
+        // We claimed it. Copy to local stack buffer for safety.
+        char local_code[4096];
+        size_t len = strlen(g_pending_code);
+        if (len < sizeof(local_code)) {
+            memcpy(local_code, g_pending_code, len + 1);
+            if (g_loadbuffer && g_pcall) {
+                int ls = g_loadbuffer(g_L, local_code, len, "fluxexec");
+                if (ls != 0) {
+                    g_last_result = 1000 + ls;
+                } else {
+                    int cs = g_pcall(g_L, 0, 0, 0);
+                    g_last_result = cs;
+                }
+            }
         }
     }
     __asm__ volatile(
@@ -124,11 +132,10 @@ Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, js
         }
     } else {
         // Have state. Queue code for game-thread execution.
-        if (g_pending) {
-            // Already have pending code, don't overwrite (race fix)
+        int pending = __sync_fetch_and_add(&g_pending, 0); // atomic read
+        if (pending) {
             result = "[fluxexec] Busy, wait...";
         } else if (g_last_result != -999) {
-            // Previous execution finished, report it
             if (g_last_result == 0) result = "[fluxexec] Executed OK";
             else if (g_last_result >= 1000) result = "[fluxexec] Load error: " + std::to_string(g_last_result - 1000);
             else result = "[fluxexec] Pcall error: " + std::to_string(g_last_result);
@@ -136,8 +143,8 @@ Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, js
         } else if (code_len < sizeof(g_pending_code) - 1) {
             memcpy(g_pending_code, code, code_len);
             g_pending_code[code_len] = '\0';
-            __sync_synchronize(); // memory barrier
-            g_pending = true;
+            __sync_synchronize();
+            __sync_lock_test_and_set(&g_pending, 1); // atomic set
             result = "[fluxexec] Queued, press Execute again for result";
         } else {
             result = "[fluxexec] Code too long";
