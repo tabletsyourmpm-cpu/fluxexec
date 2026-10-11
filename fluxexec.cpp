@@ -28,7 +28,7 @@ static int g_last_result = -999;
 
 // Offsets in libroblox.so (file offsets = vaddr offsets)
 #define OFF_LUA_PUSHNUMBER  0x76a254
-#define OFF_LUA_L_LOADBUFFER 0x769460
+#define OFF_LUA_L_LOADBUFFER 0x7694b4  // Real one (0x769460 was the modified stub)
 #define OFF_LUA_PCALL       0x76a618
 
 // Function pointers (resolved at runtime)
