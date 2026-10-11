@@ -11,15 +11,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
         with:
-          ndk-version: r25b
-          add-to-path: false
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager "ndk;25.2.9519653"
 
       - name: Build ARM64
         run: |
-          CLANG=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++
+          NDK=$ANDROID_HOME/ndk/25.2.9519653
+          CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++
           $CLANG -shared -fPIC -O2 \
             -o libfluxexec.so fluxexec.cpp \
             -ldl -llog
