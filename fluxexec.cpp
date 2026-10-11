@@ -124,15 +124,19 @@ Java_com_better16_executor_OverlayService_nativeExecute(JNIEnv* env, jobject, js
         }
     } else {
         // Have state. Queue code for game-thread execution.
-        if (g_last_result != -999 && !g_pending) {
+        if (g_pending) {
+            // Already have pending code, don't overwrite (race fix)
+            result = "[fluxexec] Busy, wait...";
+        } else if (g_last_result != -999) {
             // Previous execution finished, report it
             if (g_last_result == 0) result = "[fluxexec] Executed OK";
             else if (g_last_result >= 1000) result = "[fluxexec] Load error: " + std::to_string(g_last_result - 1000);
             else result = "[fluxexec] Pcall error: " + std::to_string(g_last_result);
             g_last_result = -999;
-        } else if (code_len < sizeof(g_pending_code)) {
+        } else if (code_len < sizeof(g_pending_code) - 1) {
             memcpy(g_pending_code, code, code_len);
             g_pending_code[code_len] = '\0';
+            __sync_synchronize(); // memory barrier
             g_pending = true;
             result = "[fluxexec] Queued, press Execute again for result";
         } else {
