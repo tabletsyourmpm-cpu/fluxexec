@@ -241,14 +241,18 @@ static void log_load_error(lua_State* L) {
     int ttype = *(int*)(tv + 8);
     if (ttype == 4) { // LUA_TSTRING
         // TValue value is TString*; string bytes follow the TString header.
-        // TString header: next(8) + hash(4) + len(4) = 16 bytes on 64-bit
-        // Actually in 5.1: CommonHeader (8: next ptr) + reserved(1)+hash(4)... let me use a safe approach:
-        // The char data is at ts+16 typically. But to be safe, scan for printable string.
+        // Lua 5.1 64-bit TString: next(8) + tt(1) + marked(1) + reserved(1) + pad(1) + hash(4) + len(8) = 24 header
         void* ts = *(void**)tv;
-        // Try offset 16 for string data (TString = {next(8), hash(4), len(4), data...} = 16 header)
-        const char* strdata = (const char*)ts + 16;
-        // Sanity: check first bytes are printable
-        if (strdata[0] >= 32 && strdata[0] < 127) {
+        const char* strdata = NULL;
+        // Try offset 24 first, then 16 as fallback
+        for (int off = 24; off >= 16; off -= 8) {
+            const char* p = (const char*)ts + off;
+            if (p[0] >= 32 && p[0] < 127) {
+                strdata = p;
+                break;
+            }
+        }
+        if (strdata) {
             char buf[256];
             int i;
             for (i = 0; i < 255 && strdata[i] >= 32 && strdata[i] < 127; i++) {
