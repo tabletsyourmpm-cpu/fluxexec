@@ -230,6 +230,40 @@ static const char* my_reader(lua_State* L, void* ud, size_t* size) {
     return ls->s;
 }
 
+// Extract error message from stack top after a failed load.
+// TValue layout (from lua_pushnumber inline asm): 16-byte stride,
+// value at [0], type tag at [8]. String type tag = 4.
+static void log_load_error(lua_State* L) {
+    // L->top at offset 0x20
+    uintptr_t top_addr = *(uintptr_t*)((char*)L + 0x20);
+    // Error is at top-1
+    char* tv = (char*)(top_addr - 0x10);
+    int ttype = *(int*)(tv + 8);
+    if (ttype == 4) { // LUA_TSTRING
+        // TValue value is TString*; string bytes follow the TString header.
+        // TString header: next(8) + hash(4) + len(4) = 16 bytes on 64-bit
+        // Actually in 5.1: CommonHeader (8: next ptr) + reserved(1)+hash(4)... let me use a safe approach:
+        // The char data is at ts+16 typically. But to be safe, scan for printable string.
+        void* ts = *(void**)tv;
+        // Try offset 16 for string data (TString = {next(8), hash(4), len(4), data...} = 16 header)
+        const char* strdata = (const char*)ts + 16;
+        // Sanity: check first bytes are printable
+        if (strdata[0] >= 32 && strdata[0] < 127) {
+            char buf[256];
+            int i;
+            for (i = 0; i < 255 && strdata[i] >= 32 && strdata[i] < 127; i++) {
+                buf[i] = strdata[i];
+            }
+            buf[i] = '\0';
+            LOGI("Load error msg: %s (type=%d)", buf, ttype);
+            return;
+        }
+        LOGI("Load error: string type but data not printable (ts=%p)", ts);
+    } else {
+        LOGI("Load error: non-string type=%d", ttype);
+    }
+}
+
 static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libroblox.so")) {
         g_roblox_base = info->dlpi_addr;
@@ -266,6 +300,7 @@ void hook_lua_pushnumber(lua_State* L, double n) {
                 int load_status = g_load(g_L, (void*)my_reader, &ls, "walkspeed");
                 if (load_status != 0) {
                     g_last_result = 1000 + load_status;
+                    log_load_error(g_L);
                 } else {
                     int cs = g_pcall(g_L, 0, 0, 0);
                     g_last_result = cs;
